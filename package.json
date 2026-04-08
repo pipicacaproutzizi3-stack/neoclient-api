@@ -1,0 +1,15 @@
+{
+  "name": "neoclient-api",
+  "version": "0.1.0",
+  "description": "NeoClient presence API (simple)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.0",
+    "express": "^4.18.2",
+    "express-rate-limit": "^6.7.0",
+    "ws": "^8.13.0"
+  }
+}
