@@ -114,6 +114,8 @@ const storePresence  = new Map();
 const storeCosmetics = new Map();
 // emotes:    Map<serverId, Map<uuid, string>>
 const storeEmotes    = new Map();
+// skinOverrides: Map<serverId, Map<uuid, { url, type }>>
+const storeSkinOverrides = new Map();
 
 /* ---------- helpers ---------- */
 function now() { return Date.now(); }
@@ -221,6 +223,32 @@ function deleteEmote(serverId, uuid) {
   map.delete(uuid);
 }
 
+
+/* ----- Skin Override helpers ----- */
+function ensureSkinOverrideServer(serverId) {
+  if (!storeSkinOverrides.has(serverId)) storeSkinOverrides.set(serverId, new Map());
+  return storeSkinOverrides.get(serverId);
+}
+function setSkinOverride(serverId, uuid, url, skinType) {
+  const map = ensureSkinOverrideServer(serverId);
+  if (url && typeof url === 'string' && url.trim().length > 0) {
+    map.set(uuid, { url: url.trim(), type: skinType || 'default' });
+  } else {
+    map.delete(uuid);
+  }
+}
+function deleteSkinOverride(serverId, uuid) {
+  const map = storeSkinOverrides.get(serverId);
+  if (map) map.delete(uuid);
+}
+function getSkinOverridesMap(serverId) {
+  const map = storeSkinOverrides.get(serverId);
+  if (!map) return {};
+  const out = {};
+  for (const [uuid, data] of map.entries()) out[uuid] = data;
+  return out;
+}
+
 /* ----- WebSocket subs and broadcast ----- */
 const subs = new Map();
 function broadcastToServerSubs(serverId, msg) {
@@ -303,8 +331,9 @@ app.post('/unregister', (req, res) => {
   deleteCosmetics(server_id, uuid);
   broadcastToServerSubs(server_id, { type: 'cosmetics_remove', uuid });
 
-  // Nettoyer l'emote active du joueur qui se deconnecte
+  // Nettoyer l'emote active et le skin override du joueur qui se deconnecte
   deleteEmote(server_id, uuid);
+  deleteSkinOverride(server_id, uuid);
   broadcastToServerSubs(server_id, { type: 'emote_update', uuid, emote: null });
 
   return res.json({ ok: true });
@@ -322,7 +351,7 @@ app.get('/servers/:serverId/neoclients', (req, res) => {
 // POST /servers/:serverId/cosmetics  (format tableau de noms)
 app.post('/servers/:serverId/cosmetics', (req, res) => {
   const serverId = req.params.serverId;
-  const { server_id, uuid, cosmetics, name } = req.body || {};
+  const { server_id, uuid, cosmetics, name, skin_override } = req.body || {};
   if (!serverId || !uuid || !Array.isArray(cosmetics)) return res.status(400).json({ ok: false, error: 'invalid' });
 
   let cleaned = Array.from(new Set(cosmetics.map(String).map(s => s.trim().toLowerCase()).filter(Boolean))).slice(0, 32);
@@ -364,6 +393,15 @@ app.post('/servers/:serverId/cosmetics', (req, res) => {
     const offline = nameUUIDFromBytes('OfflinePlayer:' + name);
     try { addAlias(serverId, uuid, name); } catch (e) {}
     try { addAlias(serverId, uuid, offline); } catch (e) {}
+  }
+
+  // Stocker / effacer le skin_override
+  if (skin_override && typeof skin_override === 'object' && skin_override.url) {
+    setSkinOverride(serverId, uuid, skin_override.url, skin_override.type || 'default');
+    console.log(`[skin_override:set] server=${serverId} uuid=${uuid} url=${skin_override.url} type=${skin_override.type||'default'}`);
+  } else if (skin_override === null) {
+    deleteSkinOverride(serverId, uuid);
+    console.log(`[skin_override:clear] server=${serverId} uuid=${uuid}`);
   }
 
   console.log(`[cosmetics:set] server=${serverId} uuid=${uuid} cosmetics=${JSON.stringify(cleaned)} name=${name||''}`);
@@ -419,8 +457,22 @@ app.post('/cosmetics/delete', (req, res) => {
 // GET /servers/:serverId/cosmetics
 app.get('/servers/:serverId/cosmetics', (req, res) => {
   const serverId = req.params.serverId;
-  const map = getCosmeticsMap(serverId);
-  return res.json({ server_id: serverId, cosmetics: map, ts: now() });
+  const cosmeticsRaw = getCosmeticsMap(serverId);
+  const skinOverrides = getSkinOverridesMap(serverId);
+
+  // Merger skin_override dans chaque entrée joueur pour que le client
+  // reçoive un objet { cosmetics: [...], skin_override: {...}, name: "..." }
+  // au lieu d'un simple tableau
+  const merged = {};
+  const allKeys = new Set([...Object.keys(cosmeticsRaw), ...Object.keys(skinOverrides)]);
+  for (const key of allKeys) {
+    const entry = {};
+    if (cosmeticsRaw[key]) entry.cosmetics = cosmeticsRaw[key];
+    if (skinOverrides[key]) entry.skin_override = skinOverrides[key];
+    merged[key] = entry;
+  }
+
+  return res.json({ server_id: serverId, cosmetics: merged, ts: now() });
 });
 
 /* ----- Emotes ----- */
