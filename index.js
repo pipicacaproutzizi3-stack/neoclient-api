@@ -4,14 +4,18 @@
 // - Support des cosmétiques au format type/ID numérique ET au format nom
 // - VERSION CHECK: endpoint pour vérifier les mises à jour du client
 // - EMOTES: synchronisation des emotes en temps réel entre joueurs NeoClient
+// - RECAP COORDINATION: anti-spam quand plusieurs joueurs NeoClient postent le même recap
 // - Endpoints:
 //   POST  /register
 //   POST  /unregister
 //   GET   /servers/:serverId/neoclients
 //   POST  /servers/:serverId/cosmetics (format tableau de noms)
 //   GET   /servers/:serverId/cosmetics
-//   POST  /servers/:serverId/emotes    (NOUVEAU)
-//   GET   /servers/:serverId/emotes    (NOUVEAU)
+//   POST  /servers/:serverId/emotes
+//   GET   /servers/:serverId/emotes
+//   POST  /servers/:serverId/recap-claims      (NOUVEAU - coordination recap)
+//   GET   /servers/:serverId/recap-claims/:recapId  (NOUVEAU)
+//   POST  /servers/:serverId/recap-posted      (NOUVEAU - broadcast)
 //   POST  /cosmetics/update (format type/ID)
 //   POST  /cosmetics/delete
 //   GET   /version
@@ -116,6 +120,8 @@ const storeCosmetics = new Map();
 const storeEmotes    = new Map();
 // skinOverrides: Map<serverId, Map<uuid, { url, type }>>
 const storeSkinOverrides = new Map();
+// recapClaims: Map<serverId, Map<recapId, { claimer, timestamp }>>
+const storeRecapClaims = new Map();
 
 /* ---------- helpers ---------- */
 function now() { return Date.now(); }
@@ -223,7 +229,6 @@ function deleteEmote(serverId, uuid) {
   map.delete(uuid);
 }
 
-
 /* ----- Skin Override helpers ----- */
 function ensureSkinOverrideServer(serverId) {
   if (!storeSkinOverrides.has(serverId)) storeSkinOverrides.set(serverId, new Map());
@@ -247,6 +252,28 @@ function getSkinOverridesMap(serverId) {
   const out = {};
   for (const [uuid, data] of map.entries()) out[uuid] = data;
   return out;
+}
+
+/* ----- Recap Coordination helpers ----- */
+function ensureRecapServer(serverId) {
+  if (!storeRecapClaims.has(serverId)) storeRecapClaims.set(serverId, new Map());
+  return storeRecapClaims.get(serverId);
+}
+function getClaim(serverId, recapId) {
+  const map = storeRecapClaims.get(serverId);
+  if (!map) return null;
+  const claim = map.get(recapId);
+  if (!claim) return null;
+  // TTL de 60 secondes pour les claims
+  if (Date.now() - claim.timestamp > 60000) {
+    map.delete(recapId);
+    return null;
+  }
+  return claim;
+}
+function setClaim(serverId, recapId, claimer) {
+  const map = ensureRecapServer(serverId);
+  map.set(recapId, { claimer, timestamp: Date.now() });
 }
 
 /* ----- WebSocket subs and broadcast ----- */
@@ -513,6 +540,101 @@ app.get('/servers/:serverId/emotes', (req, res) => {
   return res.json({ server_id: serverId, emotes, ts: now() });
 });
 
+/* ----- Recap Coordination (Anti-Spam) ----- */
+
+/**
+ * POST /servers/:serverId/recap-claims
+ * Body: { server_id, recap_id, claimer, timestamp }
+ * Retourne: { claimed: true } si premier, { claimed: false, claimer: "nom" } si déjà pris
+ * TTL: Les claims expirent après 60 secondes
+ */
+app.post('/servers/:serverId/recap-claims', (req, res) => {
+  const serverId = req.params.serverId;
+  const { recap_id, claimer } = req.body || {};
+
+  if (!serverId || !recap_id || !claimer) {
+    return res.status(400).json({ error: 'missing server_id, recap_id or claimer' });
+  }
+
+  const existing = getClaim(serverId, recap_id);
+
+  if (existing) {
+    console.log(`[recap-claims:conflict] server=${serverId} recap=${recap_id} already claimed by ${existing.claimer}`);
+    return res.status(200).json({
+      claimed: false,
+      claimer: existing.claimer,
+      timestamp: existing.timestamp
+    });
+  }
+
+  // Premier à claimer
+  setClaim(serverId, recap_id, claimer);
+  console.log(`[recap-claims:success] server=${serverId} recap=${recap_id} claimed by ${claimer}`);
+
+  // Broadcast WebSocket aux abonnés (optionnel mais pratique)
+  broadcastToServerSubs(serverId, {
+    type: 'recap_claimed',
+    recap_id,
+    claimer,
+    timestamp: Date.now()
+  });
+
+  return res.status(201).json({
+    claimed: true,
+    claimer,
+    timestamp: Date.now()
+  });
+});
+
+/**
+ * GET /servers/:serverId/recap-claims/:recapId
+ * Retourne: { claimer: "nom", timestamp: 1234567890 } ou 404
+ */
+app.get('/servers/:serverId/recap-claims/:recapId', (req, res) => {
+  const serverId = req.params.serverId;
+  const recapId = req.params.recapId;
+
+  const claim = getClaim(serverId, recapId);
+  if (!claim) {
+    return res.status(404).json({ error: 'not claimed' });
+  }
+
+  return res.json({
+    recap_id: recapId,
+    claimer: claim.claimer,
+    timestamp: claim.timestamp
+  });
+});
+
+/**
+ * POST /servers/:serverId/recap-posted (facultatif, pour broadcast rapide)
+ * Body: { server_id, recap_id, poster, timestamp }
+ * Retourne: { ok: true }
+ */
+app.post('/servers/:serverId/recap-posted', (req, res) => {
+  const serverId = req.params.serverId;
+  const { recap_id, poster } = req.body || {};
+
+  if (!serverId || !recap_id || !poster) {
+    return res.status(400).json({ error: 'missing params' });
+  }
+
+  console.log(`[recap-posted] server=${serverId} recap=${recap_id} posted by ${poster}`);
+
+  // Update le claim pour s'assurer qu'il est bien marqué
+  setClaim(serverId, recap_id, poster);
+
+  // Broadcast WebSocket
+  broadcastToServerSubs(serverId, {
+    type: 'recap_posted',
+    recap_id,
+    poster,
+    timestamp: Date.now()
+  });
+
+  return res.json({ ok: true });
+});
+
 /* ----- Admin ----- */
 
 app.post('/admin/migrate-cape', (req, res) => {
@@ -586,7 +708,14 @@ app.get('/debug/store', (req, res) => {
     emotes[sid] = {};
     for (const [uuid, emote] of map.entries()) emotes[sid][uuid] = emote;
   }
-  res.json({ now: now(), ttl_ms: TTL_MS, migrate_window_ms: MIGRATE_WINDOW_MS, presence, cosmetics, emotes });
+  const recapClaims = {};
+  for (const [sid, map] of storeRecapClaims.entries()) {
+    recapClaims[sid] = {};
+    for (const [recapId, claim] of map.entries()) {
+      recapClaims[sid][recapId] = claim;
+    }
+  }
+  res.json({ now: now(), ttl_ms: TTL_MS, migrate_window_ms: MIGRATE_WINDOW_MS, presence, cosmetics, emotes, recapClaims });
 });
 
 /* ---------- error handlers & start ---------- */
@@ -602,6 +731,7 @@ server.listen(PORT, () => {
   console.log(`NeoClient API listening on port ${PORT} (env PORT=${process.env.PORT})`);
   console.log(`NODE_ENV=${process.env.NODE_ENV || 'undefined'} TTL_MS=${TTL_MS} MIGRATE_WINDOW_MS=${MIGRATE_WINDOW_MS}`);
   console.log(`Cosmetic mappings loaded: ${Object.keys(ID_TO_NAME).length} cosmetics`);
+  console.log(`Recap coordination enabled (TTL: 60s)`);
   console.log(`Current client version: ${CLIENT_VERSION}`);
   console.log(`Download URL: ${DOWNLOAD_URL}`);
 });
