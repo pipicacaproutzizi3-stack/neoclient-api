@@ -1,7 +1,7 @@
 {
   "name": "neoclient-api",
   "version": "0.1.0",
-  "description": "NeoClient presence API (simple)",
+  "description": "NeoClient presence API with recap coordination",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
